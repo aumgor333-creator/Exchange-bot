@@ -1,13 +1,13 @@
 """
 Чтение курсов из Google Таблицы.
 
-Ожидаемая структура листа (строка заголовка + данные):
-  A: Пара (например RUB/VND, USD/VND, USDT/VND)
-  B: От (нижняя граница суммы)
-  C: До (верхняя граница суммы, пусто = без верхней границы)
-  D: Курс
+Структура листа (строка заголовка + данные), как у вас настроено сейчас:
+  A: Валютная пара (например RUB/VND, USD/VND, USDT/VND)
+  B: Курс
+  C: От (нижняя граница суммы)
+  D: До (верхняя граница суммы, пусто = без верхней границы)
 
-Если у вас другой порядок колонок — поправьте номера ниже (COL_*).
+Если поменяете порядок колонок в таблице — поправьте номера ниже (COL_*).
 """
 
 import json
@@ -16,14 +16,23 @@ import os
 import gspread
 from google.oauth2.service_account import Credentials
 
+if "GOOGLE_SHEET_ID" not in os.environ:
+    visible = sorted(os.environ.keys())
+    raise RuntimeError(
+        "Переменная GOOGLE_SHEET_ID не найдена в этом контейнере.\n"
+        "Все переменные окружения, которые реально видит процесс сейчас:\n"
+        + "\n".join(visible)
+    )
+
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 WORKSHEET_NAME = os.environ.get("GOOGLE_WORKSHEET_NAME", "Курсы")
 
 # Индексы колонок (0 = A, 1 = B, 2 = C, 3 = D)
+# Ваша таблица: A - Валютная пара, B - Курс, C - от, D - до
 COL_PAIR = 0
-COL_FROM = 1
-COL_TO = 2
-COL_RATE = 3
+COL_RATE = 1
+COL_FROM = 2
+COL_TO = 3
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 _client = None
