@@ -12,7 +12,6 @@ import re
 from datetime import datetime
 
 from telegram import (
-    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -134,65 +133,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Пожалуйста, выберите город, который вас интересует:",
         reply_markup=city_keyboard(),
     )
-
-
-async def cmd_exchange(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /exchange — оформить заявку на обмен (начать сначала)."""
-    await start(update, context)
-
-
-async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /rate — показать актуальные курсы из Google Таблицы."""
-    try:
-        rows = sheets.get_all_rows()
-    except Exception:
-        log.exception("Не удалось получить курсы из таблицы")
-        await update.message.reply_text(
-            "Не получилось получить курсы прямо сейчас. Попробуйте чуть позже "
-            "или уточните у менеджера: /support"
-        )
-        return
-
-    if not rows:
-        await update.message.reply_text("Курсы пока не заданы.")
-        return
-
-    grouped = {}
-    for row in rows:
-        grouped.setdefault(row["pair"], []).append(row)
-
-    lines = ["💱 Актуальные курсы:\n"]
-    for pair, pair_rows in grouped.items():
-        lines.append(f"{pair}:")
-        for r in pair_rows:
-            rate_str = r["rate"] if r["rate"] is not None else "—"
-            if r["from"] is not None or r["to"] is not None:
-                low = f"{r['from']:,.0f}".replace(",", " ") if r["from"] is not None else "0"
-                high = f"{r['to']:,.0f}".replace(",", " ") if r["to"] is not None else "и выше"
-                lines.append(f"  от {low} до {high}: {rate_str}")
-            else:
-                lines.append(f"  {rate_str}")
-        lines.append("")
-
-    await update.message.reply_text("\n".join(lines).strip())
-
-
-async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /support — позвать специалиста, уведомить менеджера."""
-    user = update.effective_user
-    username = f"@{user.username}" if user.username else user.full_name
-
-    await update.message.reply_text(
-        "Хорошо! Передал менеджеру, он свяжется с вами в ближайшее время 🤝"
-    )
-
-    manager_text = (
-        "🙋 ЗАПРОС СПЕЦИАЛИСТА\n\n"
-        f"👤 Клиент: {username}\n"
-        f"🆔 Telegram ID: {user.id}\n\n"
-        "Клиент хочет связаться с менеджером напрямую."
-    )
-    await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=manager_text)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -372,31 +312,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-async def _post_init(app: Application):
-    await app.bot.set_my_commands(
-        [
-            BotCommand("exchange", "Оформить заявку на обмен"),
-            BotCommand("rate", "Актуальные курсы валют и USDT"),
-            BotCommand("support", "Позвать специалиста"),
-            BotCommand("start", "Начать обмен"),
-        ]
-    )
-
-
 def main():
     persistence = PicklePersistence(filepath="bot_state.pkl")
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .persistence(persistence)
-        .post_init(_post_init)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("exchange", cmd_exchange))
-    app.add_handler(CommandHandler("rate", cmd_rate))
-    app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
