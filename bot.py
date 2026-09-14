@@ -189,10 +189,19 @@ async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+def format_client_block(user) -> str:
+    """Формирует блок с именем, username и ID клиента для заявок/уведомлений."""
+    username_line = f"@{user.username}" if user.username else "не указан"
+    return (
+        f"👤 Имя: {user.full_name}\n"
+        f"🔗 Username: {username_line}\n"
+        f"🆔 Telegram ID: {user.id}"
+    )
+
+
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /support — позвать специалиста, уведомить менеджера."""
     user = update.effective_user
-    username = f"@{user.username}" if user.username else user.full_name
 
     await update.message.reply_text(
         "Хорошо! Передал менеджеру, он свяжется с вами в ближайшее время 🤝"
@@ -200,8 +209,7 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     manager_text = (
         "🙋 ЗАПРОС СПЕЦИАЛИСТА\n\n"
-        f"👤 Клиент: {username}\n"
-        f"🆔 Telegram ID: {user.id}\n\n"
+        f"{format_client_block(user)}\n\n"
         "Клиент хочет связаться с менеджером напрямую."
     )
     await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=manager_text)
@@ -356,16 +364,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         user = query.from_user
-        username = f"@{user.username}" if user.username else user.full_name
         manager_text = (
             "🔔 НОВАЯ ЗАЯВКА\n\n"
-            f"👤 Клиент: {username}\n"
-            f"🆔 Telegram ID: {user.id}\n\n"
+            f"{format_client_block(user)}\n\n"
             "📋 Подтверждённые условия:\n"
             f"{summary}\n\n"
             f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
         await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=manager_text)
+
+        try:
+            sheets.log_order(
+                {
+                    "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "name": user.full_name,
+                    "username": f"@{user.username}" if user.username else "",
+                    "telegram_id": user.id,
+                    "city": data.get("city", ""),
+                    "pair": pair,
+                    "amount": data["amount"],
+                    "rate": data["rate"],
+                    "total_vnd": data["total_vnd"],
+                }
+            )
+        except Exception:
+            log.exception("Не удалось записать заявку в журнал таблицы")
 
         # Сброс валюты/суммы/курса, город остаётся — можно сразу оформить новый обмен
         city = data.get("city")

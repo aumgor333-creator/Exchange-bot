@@ -43,7 +43,7 @@ COL_TO = 3
 DISPLAY_PAIRS = ["RUB/VND", "USD/VND", "USDT/VND"]
 
 _SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.metadata.readonly",
 ]
 _client = None
@@ -156,3 +156,50 @@ def get_last_update():
     except Exception:
         log.exception("Не удалось получить дату последнего обновления таблицы (Drive API)")
         return None
+
+
+ORDERS_WORKSHEET_NAME = os.environ.get("GOOGLE_ORDERS_WORKSHEET_NAME", "Заявки")
+ORDERS_HEADER = [
+    "Дата/время",
+    "Имя",
+    "Username",
+    "Telegram ID",
+    "Город",
+    "Пара",
+    "Сумма",
+    "Курс",
+    "Итог VND",
+]
+
+
+def _get_or_create_orders_worksheet(spreadsheet):
+    try:
+        return spreadsheet.worksheet(ORDERS_WORKSHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(
+            title=ORDERS_WORKSHEET_NAME, rows=1000, cols=len(ORDERS_HEADER)
+        )
+        ws.append_row(ORDERS_HEADER)
+        return ws
+
+
+def log_order(order: dict):
+    """Дописывает одну строку с данными подтверждённой заявки в лист «Заявки».
+    Лист и заголовки создаются автоматически при первом обращении, если их ещё нет.
+    order: {'datetime','name','username','telegram_id','city','pair','amount','rate','total_vnd'}."""
+    client = _get_client()
+    spreadsheet = client.open_by_key(SHEET_ID)
+    ws = _get_or_create_orders_worksheet(spreadsheet)
+
+    row = [
+        order.get("datetime", ""),
+        order.get("name", ""),
+        order.get("username", ""),
+        order.get("telegram_id", ""),
+        order.get("city", ""),
+        order.get("pair", ""),
+        order.get("amount", ""),
+        order.get("rate", ""),
+        order.get("total_vnd", ""),
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
