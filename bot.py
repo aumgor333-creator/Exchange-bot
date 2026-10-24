@@ -193,7 +193,7 @@ async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     p = client_partner(update.effective_user.id)
     if p:
-        rates = [{**r, "rate": sheets.partner_rate(r["rate"], p["margin"])} for r in rates]
+        rates = [{**r, "rate": sheets.partner_rate(r["rate"], p["margin"], p.get("diff"))} for r in rates]
 
     lines = [header, ""]
     for r in rates:
@@ -313,7 +313,9 @@ async def cmd_partners(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["🤝 <b>Партнёры</b>", ""]
     for p in partners.values():
         lines += [
-            f"<b>{html.escape(p['name'])}</b> · маржа {fmt_rate(p['margin'] * 100)}%",
+            f"<b>{html.escape(p['name'])}</b> · "
+            + (f"рубль: ваш курс − {fmt_rate(p['diff'])} · USD/USDT: −{fmt_rate(p['margin'] * 100)}%"
+               if p.get("diff") else f"маржа {fmt_rate(p['margin'] * 100)}%"),
             f"Ссылка для клиентов (на сайт): https://t.me/{bot_name}?start={p['code']}",
             f"Вход для партнёра (отправить ему лично): https://t.me/{bot_name}?start={partner_login_code(p['code'])}",
             "Партнёр подключён ✅" if p["chat_id"] else "Партнёр ещё не открыл ссылку входа",
@@ -517,7 +519,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         base_rate = rate_row["rate"]
         p = client_partner(update.effective_user.id)
-        rate = sheets.partner_rate(base_rate, p["margin"]) if p else base_rate
+        rate = sheets.partner_rate(base_rate, p["margin"], p.get("diff")) if p else base_rate
         total_vnd = round(amount * rate)
 
         context.user_data["partner"] = p["code"] if p else ""
@@ -546,7 +548,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 next_row = sheets.get_rate(pair, threshold)
                 next_rate = next_row["rate"] if next_row else None
                 if next_rate and p:
-                    next_rate = sheets.partner_rate(next_rate, p["margin"])
+                    next_rate = sheets.partner_rate(next_rate, p["margin"], p.get("diff"))
                 if next_rate and next_rate > rate:
                     threshold_fmt = f"{threshold:,.0f}".replace(",", " ")
                     label = "максимальный курс" if threshold == 100000 else "курс"

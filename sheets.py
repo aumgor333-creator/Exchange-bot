@@ -207,17 +207,19 @@ def log_order(order: dict):
 
 # ---------------------------------------------------------------------------
 # ПАРТНЁРЫ
-# Лист «Партнёры»: A Код | B Имя партнёра | C Маржа % | D Chat ID партнёра
+# Лист «Партнёры»: A Код | B Имя партнёра | C Маржа % | D Chat ID партнёра | E Разница курса RUB
 # Код — латиницей, он же метка в ссылке: t.me/<бот>?start=<код>.
 # Маржа — на сколько процентов курс для клиентов партнёра ниже вашего (1 = 1%).
+# Разница курса RUB — если заполнена, курс рубля для клиентов партнёра = ваш курс минус
+# это число (286 − 2 = 284); маржа % тогда действует только для USD и USDT.
 # Chat ID бот вписывает сам, когда партнёр откроет свою ссылку входа (/partners).
 #
 # Лист «Клиенты партнёров»: кто из клиентов пришёл от какого партнёра.
 # Клиент закрепляется за первым партнёром навсегда.
 # ---------------------------------------------------------------------------
 PARTNERS_WORKSHEET_NAME = os.environ.get("GOOGLE_PARTNERS_WORKSHEET_NAME", "Партнёры")
-PARTNERS_HEADER = ["Код", "Имя партнёра", "Маржа %", "Chat ID партнёра"]
-PARTNERS_EXAMPLE = ["vietlife", "Артём · viet-life.ru", "1", ""]
+PARTNERS_HEADER = ["Код", "Имя партнёра", "Маржа %", "Chat ID партнёра", "Разница курса RUB"]
+PARTNERS_EXAMPLE = ["vietlife", "Артём · viet-life.ru", "1", "", "2"]
 
 CLIENTS_WORKSHEET_NAME = os.environ.get("GOOGLE_CLIENTS_WORKSHEET_NAME", "Клиенты партнёров")
 CLIENTS_HEADER = ["Telegram ID", "Имя", "Username", "Партнёр", "Дата"]
@@ -254,9 +256,12 @@ def get_partners(force=False):
     if not force and _partners_cache["data"] is not None and now - _partners_cache["at"] < PARTNERS_TTL:
         return _partners_cache["data"]
     ws = _sheet(PARTNERS_WORKSHEET_NAME, PARTNERS_HEADER, PARTNERS_EXAMPLE)
+    values = ws.get_all_values()
+    if values and len([c for c in values[0] if c.strip()]) < len(PARTNERS_HEADER):
+        ws.update(range_name="A1", values=[PARTNERS_HEADER])  # добавить новый заголовок «Разница курса RUB»
     data = {}
-    for i, row in enumerate(ws.get_all_values()[1:], start=2):
-        row = (row + [""] * 4)[:4]
+    for i, row in enumerate(values[1:], start=2):
+        row = (row + [""] * 5)[:5]
         code = row[0].strip().lower()
         if not code:
             continue
@@ -265,6 +270,7 @@ def get_partners(force=False):
             "name": row[1].strip() or code,
             "margin": _margin(row[2]),
             "chat_id": row[3].strip(),
+            "diff": _to_float(row[4]) if _to_float(row[4]) and _to_float(row[4]) > 0 else None,
             "row": i,
         }
     _partners_cache.update(at=now, data=data)
@@ -320,12 +326,14 @@ def set_client_partner(telegram_id, name, username, code):
     return code
 
 
-def partner_rate(rate, margin):
-    """Курс для клиента партнёра: ниже вашего на маржу, округление вниз
-    (до 0,1 для курсов меньше 1000, до целого — для остальных)."""
+def partner_rate(rate, margin, diff=None):
+    """Курс для клиента партнёра, всегда целое число.
+    Рубль (курс меньше 1000): ваш курс минус «Разница курса RUB», если она задана;
+    иначе и для USD/USDT — ниже вашего на маржу %, с округлением вниз."""
     import math
-    r = rate * (1 - margin)
-    return math.floor(r * 10) / 10 if rate < 1000 else math.floor(r)
+    if rate < 1000 and diff:
+        return math.floor(rate - diff)
+    return math.floor(rate * (1 - margin))
 
 
 # ---------------------------------------------------------------------------
