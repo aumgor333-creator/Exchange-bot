@@ -193,7 +193,7 @@ async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         header = "💰 <b>Актуальные курсы:</b>"
 
-    if p and sheet == sheets.own_sheet():
+    if p and not sheet_mode(p):
         rates = [{**r, "rate": sheets.partner_rate(r["rate"], p["margin"], p.get("diff"))} for r in rates]
 
     lines = [header, ""]
@@ -266,25 +266,32 @@ def client_partner(user_id):
         return None
 
 
+def sheet_mode(p) -> bool:
+    """У партнёра свой лист курсов (колонка «Лист курсов» заполнена и такой лист есть)."""
+    return bool(p and p.get("sheet") and sheets.sheet_exists(p["sheet"]))
+
+
 def rates_sheet(p) -> str:
     """Лист, из которого берётся курс для клиента (p — партнёр клиента или None)."""
-    if p and p.get("sheet") and sheets.sheet_exists(p["sheet"]):
-        return p["sheet"]
-    return sheets.own_sheet()
+    return p["sheet"] if sheet_mode(p) else sheets.own_sheet()
 
 
 def quote(pair, amount, p):
-    """(курс клиента, ваш курс) для суммы или None.
-    Партнёр с «Листом курсов» — курс из его листа как есть; иначе ваш курс минус маржа/разница."""
+    """(курс клиента, ваш курс, доход партнёра в VND) для суммы или None.
+    Партнёр с «Листом курсов»: курс из его листа как есть, доход = маржа % от итоговой суммы.
+    Иначе: ваш курс минус маржа/разница, доход = сумма × разница курсов."""
     sheet = rates_sheet(p)
     row = sheets.get_rate(pair, amount, sheet)
     if not row:
         return None
-    if p and sheet != sheets.own_sheet():
-        own = sheets.get_rate(pair, amount, sheets.own_sheet())
-        return row["rate"], (own["rate"] if own else row["rate"])
+    if sheet_mode(p):
+        rate = row["rate"]
+        return rate, rate, round(amount * rate * p["margin"])
     base = row["rate"]
-    return (sheets.partner_rate(base, p["margin"], p.get("diff")) if p else base), base
+    if not p:
+        return base, base, 0
+    rate = sheets.partner_rate(base, p["margin"], p.get("diff"))
+    return rate, base, max(0, round(amount * (base - rate)))
 
 
 def is_manager_chat(chat_id) -> bool:
@@ -336,7 +343,8 @@ async def cmd_partners(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for p in partners.values():
         lines += [
             f"<b>{html.escape(p['name'])}</b> · "
-            + (f"курсы из листа «{html.escape(p['sheet'])}», ваши — из «{html.escape(sheets.own_sheet())}»"
+            + (f"курсы из листа «{html.escape(p['sheet'])}», доход {fmt_rate(p['margin'] * 100)}% от суммы обмена; "
+               f"ваши клиенты — курсы из «{html.escape(sheets.own_sheet())}»"
                if p.get("sheet") else
                f"рубль: ваш курс − {fmt_rate(p['diff'])} · USD/USDT: −{fmt_rate(p['margin'] * 100)}%"
                if p.get("diff") else f"маржа {fmt_rate(p['margin'] * 100)}%"),
@@ -550,11 +558,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        rate, base_rate = q
+        rate, base_rate, partner_income = q
         total_vnd = round(amount * rate)
 
         context.user_data["partner"] = p["code"] if p else ""
         context.user_data["base_rate"] = base_rate
+        context.user_data["partner_income"] = partner_income
         context.user_data["amount"] = amount
         context.user_data["rate"] = rate
         context.user_data["total_vnd"] = total_vnd
@@ -630,7 +639,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = query.from_user
         partner = sheets.get_partners().get(data.get("partner")) if data.get("partner") else None
         base_rate = data.get("base_rate", data["rate"])
-        income = max(0, round(data["amount"] * (base_rate - data["rate"]))) if partner else 0
+        income = data.get("partner_income", 0) if partner else 0
 
         row_no = None
         try:
@@ -656,8 +665,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         number = f" №{row_no - 1}" if row_no else ""
         partner_line = (
-            f"🤝 Клиент партнёра: {html.escape(partner['name'])} (ваш курс {fmt_rate(base_rate)}, "
-            f"доход партнёра {fmt_num(income)} ₫)\n\n"
+            f"🤝 Клиент партнёра: {html.escape(partner['name'])} "
+            + (f"(доход партнёра {fmt_rate(partner['margin'] * 100)}% = {fmt_num(income)} ₫)\n\n"
+               if partner.get("sheet") else
+               f"(ваш курс {fmt_rate(base_rate)}, доход партнёра {fmt_num(income)} ₫)\n\n")
             if partner else ""
         )
         manager_text = (
