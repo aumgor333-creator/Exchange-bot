@@ -170,8 +170,10 @@ MONTHS_RU = [
 
 async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /rate — показать актуальные курсы из Google Таблицы."""
+    p = client_partner(update.effective_user.id)
     try:
-        rates = sheets.get_best_rates()
+        sheet = rates_sheet(p)
+        rates = sheets.get_best_rates(sheet)
     except Exception:
         log.exception("Не удалось получить курсы из таблицы")
         await update.message.reply_text(
@@ -191,8 +193,7 @@ async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         header = "💰 <b>Актуальные курсы:</b>"
 
-    p = client_partner(update.effective_user.id)
-    if p:
+    if p and sheet == sheets.own_sheet():
         rates = [{**r, "rate": sheets.partner_rate(r["rate"], p["margin"], p.get("diff"))} for r in rates]
 
     lines = [header, ""]
@@ -265,6 +266,27 @@ def client_partner(user_id):
         return None
 
 
+def rates_sheet(p) -> str:
+    """Лист, из которого берётся курс для клиента (p — партнёр клиента или None)."""
+    if p and p.get("sheet") and sheets.sheet_exists(p["sheet"]):
+        return p["sheet"]
+    return sheets.own_sheet()
+
+
+def quote(pair, amount, p):
+    """(курс клиента, ваш курс) для суммы или None.
+    Партнёр с «Листом курсов» — курс из его листа как есть; иначе ваш курс минус маржа/разница."""
+    sheet = rates_sheet(p)
+    row = sheets.get_rate(pair, amount, sheet)
+    if not row:
+        return None
+    if p and sheet != sheets.own_sheet():
+        own = sheets.get_rate(pair, amount, sheets.own_sheet())
+        return row["rate"], (own["rate"] if own else row["rate"])
+    base = row["rate"]
+    return (sheets.partner_rate(base, p["margin"], p.get("diff")) if p else base), base
+
+
 def is_manager_chat(chat_id) -> bool:
     return str(chat_id) == str(MANAGER_CHAT_ID)
 
@@ -314,7 +336,9 @@ async def cmd_partners(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for p in partners.values():
         lines += [
             f"<b>{html.escape(p['name'])}</b> · "
-            + (f"рубль: ваш курс − {fmt_rate(p['diff'])} · USD/USDT: −{fmt_rate(p['margin'] * 100)}%"
+            + (f"курсы из листа «{html.escape(p['sheet'])}», ваши — из «{html.escape(sheets.own_sheet())}»"
+               if p.get("sheet") else
+               f"рубль: ваш курс − {fmt_rate(p['diff'])} · USD/USDT: −{fmt_rate(p['margin'] * 100)}%"
                if p.get("diff") else f"маржа {fmt_rate(p['margin'] * 100)}%"),
             f"Ссылка для клиентов (на сайт): https://t.me/{bot_name}?start={p['code']}",
             f"Вход для партнёра (отправить ему лично): https://t.me/{bot_name}?start={partner_login_code(p['code'])}",
@@ -509,25 +533,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Укажите сумму для обмена, пожалуйста.")
             return
 
-        rate_row = sheets.get_rate(pair, amount)
-        min_amount = sheets.get_min_amount(pair) if not rate_row else None
-        if not rate_row and min_amount and amount < min_amount:
+        p = client_partner(update.effective_user.id)
+        q = quote(pair, amount, p)
+        min_amount = sheets.get_min_amount(pair, rates_sheet(p)) if not q else None
+        if not q and min_amount and amount < min_amount:
             await update.message.reply_text(
                 f"Минимальная сумма обмена — {fmt_num(min_amount)} {CURRENCY_LABEL[pair]}. "
                 "Укажите сумму побольше, пожалуйста.",
                 reply_markup=amount_keyboard(pair),
             )
             return
-        if not rate_row:
+        if not q:
             await update.message.reply_text(
                 "Для такой суммы курс сейчас не настроен. "
                 "Пожалуйста, укажите другую сумму или уточните у менеджера."
             )
             return
 
-        base_rate = rate_row["rate"]
-        p = client_partner(update.effective_user.id)
-        rate = sheets.partner_rate(base_rate, p["margin"], p.get("diff")) if p else base_rate
+        rate, base_rate = q
         total_vnd = round(amount * rate)
 
         context.user_data["partner"] = p["code"] if p else ""
@@ -553,10 +576,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for threshold, icon in ((50000, "🚀"), (100000, "💎")):
                 if amount >= threshold:
                     continue
-                next_row = sheets.get_rate(pair, threshold)
-                next_rate = next_row["rate"] if next_row else None
-                if next_rate and p:
-                    next_rate = sheets.partner_rate(next_rate, p["margin"], p.get("diff"))
+                nq = quote(pair, threshold, p)
+                next_rate = nq[0] if nq else None
                 if next_rate and next_rate > rate:
                     threshold_fmt = f"{threshold:,.0f}".replace(",", " ")
                     label = "максимальный курс" if threshold == 100000 else "курс"
@@ -609,7 +630,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = query.from_user
         partner = sheets.get_partners().get(data.get("partner")) if data.get("partner") else None
         base_rate = data.get("base_rate", data["rate"])
-        income = round(data["amount"] * (base_rate - data["rate"])) if partner else 0
+        income = max(0, round(data["amount"] * (base_rate - data["rate"]))) if partner else 0
 
         row_no = None
         try:

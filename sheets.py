@@ -80,11 +80,36 @@ def _to_float(value):
         return None
 
 
-def get_rate(pair: str, amount: float):
+OWN_WORKSHEET_NAME = os.environ.get("GOOGLE_OWN_WORKSHEET_NAME", "Мои курсы")
+_exists_cache = {}
+
+
+def sheet_exists(name: str) -> bool:
+    """Есть ли в таблице лист с таким названием (кэш на минуту)."""
+    import time
+    hit = _exists_cache.get(name)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    try:
+        names = [ws.title for ws in _get_client().open_by_key(SHEET_ID).worksheets()]
+    except Exception:
+        log.exception("Не удалось получить список листов")
+        return False
+    for n in set(names) | {name}:
+        _exists_cache[n] = (time.time(), n in names)
+    return name in names
+
+
+def own_sheet() -> str:
+    """Лист с курсами для ваших прямых клиентов: «Мои курсы», если он есть, иначе основной «Курсы»."""
+    return OWN_WORKSHEET_NAME if sheet_exists(OWN_WORKSHEET_NAME) else WORKSHEET_NAME
+
+
+def get_rate(pair: str, amount: float, worksheet: str = None):
     """Возвращает {'rate': float, 'from': float|None, 'to': float|None}
     для первой подходящей строки, либо None, если строка не найдена."""
     client = _get_client()
-    sheet = client.open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME)
+    sheet = client.open_by_key(SHEET_ID).worksheet(worksheet or WORKSHEET_NAME)
     rows = sheet.get_all_values()[1:]  # пропускаем заголовок
 
     for row in rows:
@@ -109,10 +134,10 @@ def get_rate(pair: str, amount: float):
     return None
 
 
-def get_min_amount(pair: str):
+def get_min_amount(pair: str, worksheet: str = None):
     """Наименьшая сумма «от» для пары в листе курсов (минимум обмена) или None."""
     try:
-        rows = _get_client().open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME).get_all_values()[1:]
+        rows = _get_client().open_by_key(SHEET_ID).worksheet(worksheet or WORKSHEET_NAME).get_all_values()[1:]
     except Exception:
         log.exception("Не удалось прочитать минимальную сумму")
         return None
@@ -124,14 +149,14 @@ def get_min_amount(pair: str):
     return min(lows) if lows else None
 
 
-def get_best_rates():
+def get_best_rates(worksheet: str = None):
     """Возвращает лучший (самый выгодный) курс по каждой из трёх пар
     RUB/VND, USD/VND, USDT/VND — для RUB/VND это тариф с наибольшим
     порогом «от» (топ-диапазон, обычно от 100 000).
     Результат: [{'pair': 'RUB/VND', 'rate': 275.0}, ...] в порядке DISPLAY_PAIRS,
     пары без данных в таблице пропускаются."""
     client = _get_client()
-    sheet = client.open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME)
+    sheet = client.open_by_key(SHEET_ID).worksheet(worksheet or WORKSHEET_NAME)
     rows = sheet.get_all_values()[1:]
 
     best_by_pair = {}
@@ -222,19 +247,21 @@ def log_order(order: dict):
 
 # ---------------------------------------------------------------------------
 # ПАРТНЁРЫ
-# Лист «Партнёры»: A Код | B Имя партнёра | C Маржа % | D Chat ID партнёра | E Разница курса RUB
+# Лист «Партнёры»: A Код | B Имя партнёра | C Маржа % | D Chat ID партнёра | E Разница курса RUB | F Лист курсов
 # Код — латиницей, он же метка в ссылке: t.me/<бот>?start=<код>.
 # Маржа — на сколько процентов курс для клиентов партнёра ниже вашего (1 = 1%).
 # Разница курса RUB — если заполнена, курс рубля для клиентов партнёра = ваш курс минус
 # это число (286 − 2 = 284); маржа % тогда действует только для USD и USDT.
+# Лист курсов — если заполнен (например «Курсы»), клиенты партнёра получают курсы из этого
+# листа как есть, без маржи и разницы. Ваши прямые клиенты — из листа «Мои курсы», если он есть.
 # Chat ID бот вписывает сам, когда партнёр откроет свою ссылку входа (/partners).
 #
 # Лист «Клиенты партнёров»: кто из клиентов пришёл от какого партнёра.
 # Клиент закрепляется за первым партнёром навсегда.
 # ---------------------------------------------------------------------------
 PARTNERS_WORKSHEET_NAME = os.environ.get("GOOGLE_PARTNERS_WORKSHEET_NAME", "Партнёры")
-PARTNERS_HEADER = ["Код", "Имя партнёра", "Маржа %", "Chat ID партнёра", "Разница курса RUB"]
-PARTNERS_EXAMPLE = ["vietlife", "Артём · viet-life.ru", "1", "", "2"]
+PARTNERS_HEADER = ["Код", "Имя партнёра", "Маржа %", "Chat ID партнёра", "Разница курса RUB", "Лист курсов"]
+PARTNERS_EXAMPLE = ["vietlife", "Артём · viet-life.ru", "1", "", "2", ""]
 
 CLIENTS_WORKSHEET_NAME = os.environ.get("GOOGLE_CLIENTS_WORKSHEET_NAME", "Клиенты партнёров")
 CLIENTS_HEADER = ["Telegram ID", "Имя", "Username", "Партнёр", "Дата"]
@@ -276,7 +303,7 @@ def get_partners(force=False):
         ws.update(range_name="A1", values=[PARTNERS_HEADER])  # добавить новый заголовок «Разница курса RUB»
     data = {}
     for i, row in enumerate(values[1:], start=2):
-        row = (row + [""] * 5)[:5]
+        row = (row + [""] * 6)[:6]
         code = row[0].strip().lower()
         if not code:
             continue
@@ -286,6 +313,7 @@ def get_partners(force=False):
             "margin": _margin(row[2]),
             "chat_id": row[3].strip(),
             "diff": _to_float(row[4]) if _to_float(row[4]) and _to_float(row[4]) > 0 else None,
+            "sheet": row[5].strip() or None,
             "row": i,
         }
     _partners_cache.update(at=now, data=data)
