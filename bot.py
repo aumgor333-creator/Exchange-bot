@@ -6,6 +6,9 @@
 Настройка — см. README.md.
 """
 
+import hashlib
+import hmac
+import html
 import logging
 import os
 import re
@@ -127,6 +130,19 @@ def confirm_keyboard():
 # ОБРАБОТЧИКИ
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    arg = (context.args[0] if getattr(context, "args", None) else "").strip()
+    if arg.startswith("pl_"):
+        await partner_login(update, context, arg)
+        return
+    if arg:
+        try:
+            if arg.lower() in sheets.get_partners():
+                user = update.effective_user
+                sheets.set_client_partner(
+                    user.id, user.full_name, f"@{user.username}" if user.username else "", arg.lower()
+                )
+        except Exception:
+            log.exception("Не удалось закрепить клиента за партнёром")
     context.user_data.clear()
     context.user_data["stage"] = "city"
     await update.message.reply_text(
@@ -175,11 +191,15 @@ async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         header = "💰 <b>Актуальные курсы:</b>"
 
+    p = client_partner(update.effective_user.id)
+    if p:
+        rates = [{**r, "rate": sheets.partner_rate(r["rate"], p["margin"])} for r in rates]
+
     lines = [header, ""]
     for r in rates:
         icon = CURRENCY_ICON.get(r["pair"], "⚪")
         code = r["pair"].split("/")[0]
-        rate_str = f"{r['rate']:,.0f}".replace(",", " ")
+        rate_str = fmt_rate(r["rate"])
         lines.append(f"{icon} <b>{code}</b>  →  {rate_str} VND")
 
     lines.append("")
@@ -197,6 +217,197 @@ def format_client_block(user) -> str:
         f"🔗 Username: {username_line}\n"
         f"🆔 Telegram ID: {user.id}"
     )
+
+
+# ---------------------------------------------------------------------------
+# ПАРТНЁРЫ
+# ---------------------------------------------------------------------------
+STATUSES = {
+    "work": "💬 в работе",
+    "meet": "📍 встреча назначена",
+    "done": "✅ обмен состоялся",
+    "lost": "❌ отказ",
+}
+STATUS_SHEET = {"work": "в работе", "meet": "встреча", "done": "обмен", "lost": "отказ"}
+
+
+def fmt_num(x) -> str:
+    return f"{float(x):,.0f}".replace(",", " ")
+
+
+def fmt_rate(x) -> str:
+    x = float(x)
+    return (f"{x:.1f}".rstrip("0").rstrip(".") if x < 1000 else fmt_num(x))
+
+
+def partner_login_code(code: str) -> str:
+    """Секретная ссылка входа для партнёра: pl_<код>_<подпись>."""
+    sig = hmac.new(BOT_TOKEN.encode(), f"partner:{code}".encode(), hashlib.sha256).hexdigest()[:12]
+    return f"pl_{code}_{sig}"
+
+
+def client_partner(user_id):
+    """Партнёр, за которым закреплён клиент (dict) или None. Ошибки таблицы не ломают бота."""
+    try:
+        code = sheets.get_client_partner(user_id)
+        return sheets.get_partners().get(code) if code else None
+    except Exception:
+        log.exception("Не удалось прочитать партнёров из таблицы")
+        return None
+
+
+def is_manager_chat(chat_id) -> bool:
+    return str(chat_id) == str(MANAGER_CHAT_ID)
+
+
+async def partner_login(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str):
+    try:
+        partners = sheets.get_partners(force=True)
+    except Exception:
+        log.exception("Партнёры недоступны")
+        await update.message.reply_text("Не получилось подключить, попробуйте позже.")
+        return
+    code = next((c for c in partners if partner_login_code(c) == arg), None)
+    if not code:
+        await update.message.reply_text("Ссылка устарела или неверная. Попросите новую у менеджера.")
+        return
+    chat_id = update.effective_chat.id
+    sheets.set_partner_chat(code, chat_id)
+    p = partners[code]
+    await update.message.reply_text(
+        f"Готово, вы подключены как партнёр «{p['name']}» 🤝\n\n"
+        "Сюда будут приходить заявки ваших клиентов с их контактами, "
+        "все изменения статуса и ваш доход по каждому обмену.\n\n"
+        "/my — ваши заявки и доход за месяц"
+    )
+    await context.bot.send_message(
+        chat_id=MANAGER_CHAT_ID,
+        text=f"🤝 Партнёр «{p['name']}» подключился к боту.\n{format_client_block(update.effective_user)}",
+    )
+
+
+async def cmd_partners(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/partners — только в чате менеджера: ссылки для клиентов и входа партнёров."""
+    if not is_manager_chat(update.effective_chat.id):
+        return
+    try:
+        partners = sheets.get_partners(force=True)
+    except Exception:
+        log.exception("Партнёры недоступны")
+        await update.message.reply_text("Не удалось прочитать лист «Партнёры» в таблице.")
+        return
+    if not partners:
+        await update.message.reply_text("В листе «Партнёры» пока нет ни одного партнёра.")
+        return
+    bot_name = context.bot.username
+    lines = ["🤝 <b>Партнёры</b>", ""]
+    for p in partners.values():
+        lines += [
+            f"<b>{html.escape(p['name'])}</b> · маржа {fmt_rate(p['margin'] * 100)}%",
+            f"Ссылка для клиентов (на сайт): https://t.me/{bot_name}?start={p['code']}",
+            f"Вход для партнёра (отправить ему лично): https://t.me/{bot_name}?start={partner_login_code(p['code'])}",
+            "Партнёр подключён ✅" if p["chat_id"] else "Партнёр ещё не открыл ссылку входа",
+            "",
+        ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/my — для партнёра: его заявки и доход за текущий месяц."""
+    try:
+        p = sheets.partner_by_chat(update.effective_chat.id)
+    except Exception:
+        log.exception("Партнёры недоступны")
+        p = None
+    if not p:
+        await update.message.reply_text("Эта команда для партнёров.")
+        return
+    month = datetime.now().strftime("%Y-%m")
+    orders = sheets.partner_orders(p["code"], month)
+    if not orders:
+        await update.message.reply_text("В этом месяце заявок от ваших клиентов пока нет.")
+        return
+    lines = [f"📋 <b>Ваши заявки за {datetime.now().strftime('%m.%Y')}</b>", ""]
+    done_sum = done_income = 0.0
+    done_n = lost_n = 0
+    for row_no, d in orders:
+        status = d["Статус"] or "новая"
+        user = html.escape(d["Username"] or d["Имя"])
+        lines.append(
+            f"№{row_no - 1} · {html.escape(d['Имя'])} {user if d['Username'] else ''}\n"
+            f"   {fmt_num(sheets._to_float(d['Сумма']) or 0)} {d['Пара'].split('/')[0]} · {status}"
+        )
+        if status == "обмен":
+            done_n += 1
+            done_sum += sheets._to_float(d["Итог VND"]) or 0
+            done_income += sheets._to_float(d["Доход партнёра VND"]) or 0
+        elif status == "отказ":
+            lost_n += 1
+    lines += [
+        "",
+        f"Заявок: {len(orders)} · обменов: {done_n} · отказов: {lost_n}",
+        f"Выдано клиентам: {fmt_num(done_sum)} ₫",
+        f"💰 Ваш доход за месяц: <b>{fmt_num(done_income)} ₫</b>",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+def status_keyboard(row_no):
+    if not row_no:
+        return None
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💬 В работе", callback_data=f"st:{row_no}:work"),
+                InlineKeyboardButton("📍 Встреча", callback_data=f"st:{row_no}:meet"),
+            ],
+            [
+                InlineKeyboardButton("✅ Обмен", callback_data=f"st:{row_no}:done"),
+                InlineKeyboardButton("❌ Отказ", callback_data=f"st:{row_no}:lost"),
+            ],
+        ]
+    )
+
+
+async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_manager_chat(query.message.chat_id):
+        await query.answer("Статусы меняет менеджер")
+        return
+    _, row_s, st = query.data.split(":")
+    row_no = int(row_s)
+    try:
+        sheets.set_order_status(row_no, STATUS_SHEET[st])
+        order = sheets.get_order(row_no)
+    except Exception:
+        log.exception("Не удалось обновить статус")
+        await query.answer("Таблица недоступна, попробуйте ещё раз", show_alert=True)
+        return
+    await query.answer(STATUSES[st])
+
+    text = "\n".join(l for l in (query.message.text or "").split("\n") if not l.startswith("📌 Статус:"))
+    final = st in ("done", "lost")
+    await query.edit_message_text(
+        f"{text}\n📌 Статус: {STATUSES[st]}",
+        reply_markup=None if final else status_keyboard(row_no),
+    )
+
+    code = (order.get("Партнёр") or "").strip().lower()
+    p = sheets.get_partners().get(code) if code else None
+    if p and p["chat_id"]:
+        name = html.escape(order.get("Имя", ""))
+        msg = f"{STATUSES[st].split(' ', 1)[0]} №{row_no - 1} · {name} · {STATUSES[st].split(' ', 1)[1]}"
+        if st == "done":
+            amount = sheets._to_float(order.get("Сумма")) or 0
+            msg += (
+                f"\n{fmt_num(amount)} {order.get('Пара', '').split('/')[0]} ↔ "
+                f"{fmt_num(sheets._to_float(order.get('Итог VND')) or 0)} ₫"
+                f"\n💰 Ваш доход: <b>{fmt_num(sheets._to_float(order.get('Доход партнёра VND')) or 0)} ₫</b>"
+            )
+        try:
+            await context.bot.send_message(chat_id=p["chat_id"], text=msg, parse_mode="HTML")
+        except Exception:
+            log.exception("Не удалось отправить статус партнёру")
 
 
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -292,9 +503,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        rate = rate_row["rate"]
+        base_rate = rate_row["rate"]
+        p = client_partner(update.effective_user.id)
+        rate = sheets.partner_rate(base_rate, p["margin"]) if p else base_rate
         total_vnd = round(amount * rate)
 
+        context.user_data["partner"] = p["code"] if p else ""
+        context.user_data["base_rate"] = base_rate
         context.user_data["amount"] = amount
         context.user_data["rate"] = rate
         context.user_data["total_vnd"] = total_vnd
@@ -308,7 +523,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Вы хотите обменять {amount_fmt} {CURRENCY_LABEL[pair]} "
             f"{CITY_PHRASE.get(city, 'в ' + city)}.",
             f"Направление: {pair.replace('/VND', '')} → VND",
-            f"Курс: {rate}",
+            f"Курс: {fmt_rate(rate)}",
             f"Итоговая сумма: {total_fmt} VND",
         ]
         if pair == "RUB/VND":
@@ -317,11 +532,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if amount >= threshold:
                     continue
                 next_row = sheets.get_rate(pair, threshold)
-                if next_row and next_row["rate"] > rate:
+                next_rate = next_row["rate"] if next_row else None
+                if next_rate and p:
+                    next_rate = sheets.partner_rate(next_rate, p["margin"])
+                if next_rate and next_rate > rate:
                     threshold_fmt = f"{threshold:,.0f}".replace(",", " ")
                     label = "максимальный курс" if threshold == 100000 else "курс"
                     tier_lines.append(
-                        f"• От {threshold_fmt} ₽: {label} {next_row['rate']:.0f} {icon}"
+                        f"• От {threshold_fmt} ₽: {label} {fmt_rate(next_rate)} {icon}"
                     )
             if tier_lines:
                 lines.append("")
@@ -342,6 +560,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if (query.data or "").startswith("st:"):
+        await handle_status(update, context)
+        return
     await query.answer()
 
     if query.data == "confirm_order":
@@ -354,7 +575,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Вы хотите обменять {amount_fmt} {CURRENCY_LABEL[pair]} "
             f"{CITY_PHRASE.get(data['city'], 'в ' + data['city'])}.\n"
             f"Направление: {pair.replace('/VND', '')} → VND\n"
-            f"Курс: {data['rate']}\n"
+            f"Курс: {fmt_rate(data['rate'])}\n"
             f"Итоговая сумма: {total_fmt} VND"
         )
 
@@ -364,17 +585,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         user = query.from_user
-        manager_text = (
-            "🔔 НОВАЯ ЗАЯВКА\n\n"
-            f"{format_client_block(user)}\n\n"
-            "📋 Подтверждённые условия:\n"
-            f"{summary}\n\n"
-            f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        )
-        await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=manager_text)
+        partner = sheets.get_partners().get(data.get("partner")) if data.get("partner") else None
+        base_rate = data.get("base_rate", data["rate"])
+        income = round(data["amount"] * (base_rate - data["rate"])) if partner else 0
 
+        row_no = None
         try:
-            sheets.log_order(
+            row_no = sheets.log_order_full(
                 {
                     "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "name": user.full_name,
@@ -385,10 +602,49 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "amount": data["amount"],
                     "rate": data["rate"],
                     "total_vnd": data["total_vnd"],
+                    "partner": partner["code"] if partner else "",
+                    "base_rate": base_rate if partner else "",
+                    "partner_income": income if partner else "",
+                    "status": "новая",
                 }
             )
         except Exception:
             log.exception("Не удалось записать заявку в журнал таблицы")
+
+        number = f" №{row_no - 1}" if row_no else ""
+        partner_line = (
+            f"🤝 Клиент партнёра: {partner['name']} (ваш курс {fmt_rate(base_rate)}, "
+            f"доход партнёра {fmt_num(income)} ₫)\n\n"
+            if partner else ""
+        )
+        manager_text = (
+            f"🔔 НОВАЯ ЗАЯВКА{number}\n\n"
+            f"{partner_line}"
+            f"{format_client_block(user)}\n\n"
+            "📋 Подтверждённые условия:\n"
+            f"{summary}\n\n"
+            f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            "📌 Статус: 🆕 новая"
+        )
+        await context.bot.send_message(
+            chat_id=MANAGER_CHAT_ID, text=manager_text, reply_markup=status_keyboard(row_no)
+        )
+
+        if partner and partner["chat_id"]:
+            uname = f" · @{html.escape(user.username)}" if user.username else ""
+            try:
+                await context.bot.send_message(
+                    chat_id=partner["chat_id"],
+                    parse_mode="HTML",
+                    text=(
+                        f"🆕 <b>Новая заявка{number}</b>\n"
+                        f"👤 <a href=\"tg://user?id={user.id}\">{html.escape(user.full_name)}</a>{uname}\n"
+                        f"💱 {amount_fmt} {pair.split('/')[0]} → {total_fmt} ₫ · {html.escape(data['city'])}\n"
+                        f"💰 Ваш доход, если обмен состоится: {fmt_num(income)} ₫"
+                    ),
+                )
+            except Exception:
+                log.exception("Не удалось отправить заявку партнёру")
 
         # Сброс валюты/суммы/курса, город остаётся — можно сразу оформить новый обмен
         city = data.get("city")
@@ -440,6 +696,8 @@ def main():
     app.add_handler(CommandHandler("exchange", cmd_exchange))
     app.add_handler(CommandHandler("rate", cmd_rate))
     app.add_handler(CommandHandler("support", cmd_support))
+    app.add_handler(CommandHandler("partners", cmd_partners))
+    app.add_handler(CommandHandler("my", cmd_my))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

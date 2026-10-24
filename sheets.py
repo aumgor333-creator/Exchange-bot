@@ -203,3 +203,182 @@ def log_order(order: dict):
         order.get("total_vnd", ""),
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+# ---------------------------------------------------------------------------
+# ПАРТНЁРЫ
+# Лист «Партнёры»: A Код | B Имя партнёра | C Маржа % | D Chat ID партнёра
+# Код — латиницей, он же метка в ссылке: t.me/<бот>?start=<код>.
+# Маржа — на сколько процентов курс для клиентов партнёра ниже вашего (1 = 1%).
+# Chat ID бот вписывает сам, когда партнёр откроет свою ссылку входа (/partners).
+#
+# Лист «Клиенты партнёров»: кто из клиентов пришёл от какого партнёра.
+# Клиент закрепляется за первым партнёром навсегда.
+# ---------------------------------------------------------------------------
+PARTNERS_WORKSHEET_NAME = os.environ.get("GOOGLE_PARTNERS_WORKSHEET_NAME", "Партнёры")
+PARTNERS_HEADER = ["Код", "Имя партнёра", "Маржа %", "Chat ID партнёра"]
+PARTNERS_EXAMPLE = ["vietlife", "Артём · viet-life.ru", "1", ""]
+
+CLIENTS_WORKSHEET_NAME = os.environ.get("GOOGLE_CLIENTS_WORKSHEET_NAME", "Клиенты партнёров")
+CLIENTS_HEADER = ["Telegram ID", "Имя", "Username", "Партнёр", "Дата"]
+
+_partners_cache = {"at": 0.0, "data": None}
+_clients_cache = None  # {telegram_id(str): partner_code}
+PARTNERS_TTL = 60  # сек — правки в таблице подхватываются в течение минуты
+
+
+def _sheet(name, header, example=None):
+    spreadsheet = _get_client().open_by_key(SHEET_ID)
+    try:
+        return spreadsheet.worksheet(name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=name, rows=500, cols=len(header))
+        ws.append_row(header)
+        if example:
+            ws.append_row(example)
+        return ws
+
+
+def _margin(value):
+    """'1' / '1%' / '1,5' → 0.01 / 0.01 / 0.015."""
+    v = _to_float(str(value or "").replace("%", ""))
+    if v is None or v < 0 or v >= 50:
+        return 0.0
+    return v / 100
+
+
+def get_partners(force=False):
+    """{код: {'code','name','margin','chat_id','row'}} — с кэшем на минуту."""
+    import time
+    now = time.time()
+    if not force and _partners_cache["data"] is not None and now - _partners_cache["at"] < PARTNERS_TTL:
+        return _partners_cache["data"]
+    ws = _sheet(PARTNERS_WORKSHEET_NAME, PARTNERS_HEADER, PARTNERS_EXAMPLE)
+    data = {}
+    for i, row in enumerate(ws.get_all_values()[1:], start=2):
+        row = (row + [""] * 4)[:4]
+        code = row[0].strip().lower()
+        if not code:
+            continue
+        data[code] = {
+            "code": code,
+            "name": row[1].strip() or code,
+            "margin": _margin(row[2]),
+            "chat_id": row[3].strip(),
+            "row": i,
+        }
+    _partners_cache.update(at=now, data=data)
+    return data
+
+
+def partner_by_chat(chat_id):
+    for p in get_partners().values():
+        if p["chat_id"] and p["chat_id"] == str(chat_id):
+            return p
+    return None
+
+
+def set_partner_chat(code, chat_id):
+    p = get_partners(force=True).get(code)
+    if not p:
+        return False
+    ws = _sheet(PARTNERS_WORKSHEET_NAME, PARTNERS_HEADER)
+    ws.update_cell(p["row"], 4, str(chat_id))
+    get_partners(force=True)
+    return True
+
+
+def _load_clients():
+    global _clients_cache
+    if _clients_cache is None:
+        ws = _sheet(CLIENTS_WORKSHEET_NAME, CLIENTS_HEADER)
+        _clients_cache = {}
+        for row in ws.get_all_values()[1:]:
+            if len(row) >= 4 and row[0].strip() and row[3].strip():
+                _clients_cache.setdefault(row[0].strip(), row[3].strip().lower())
+    return _clients_cache
+
+
+def get_client_partner(telegram_id):
+    """Код партнёра, за которым закреплён клиент, или None."""
+    return _load_clients().get(str(telegram_id))
+
+
+def set_client_partner(telegram_id, name, username, code):
+    """Закрепляет клиента за партнёром, если он ещё ни за кем не закреплён.
+    Возвращает код партнёра, за которым клиент закреплён в итоге."""
+    clients = _load_clients()
+    key = str(telegram_id)
+    if key in clients:
+        return clients[key]
+    ws = _sheet(CLIENTS_WORKSHEET_NAME, CLIENTS_HEADER)
+    ws.append_row(
+        [key, name, username, code, datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M")],
+        value_input_option="RAW",
+    )
+    clients[key] = code
+    return code
+
+
+def partner_rate(rate, margin):
+    """Курс для клиента партнёра: ниже вашего на маржу, округление вниз
+    (до 0,1 для курсов меньше 1000, до целого — для остальных)."""
+    import math
+    r = rate * (1 - margin)
+    return math.floor(r * 10) / 10 if rate < 1000 else math.floor(r)
+
+
+# ---------------------------------------------------------------------------
+# ЗАЯВКИ: дополнительные колонки для партнёров и статусов
+# ---------------------------------------------------------------------------
+ORDERS_HEADER += ["Партнёр", "Ваш курс", "Доход партнёра VND", "Статус"]
+COL_O_PARTNER, COL_O_BASE, COL_O_INCOME, COL_O_STATUS = 10, 11, 12, 13  # номера колонок (A = 1)
+
+
+def _orders_ws():
+    ws = _get_or_create_orders_worksheet(_get_client().open_by_key(SHEET_ID))
+    head = ws.row_values(1)
+    if len(head) < len(ORDERS_HEADER):
+        ws.update(range_name="A1", values=[ORDERS_HEADER])
+    return ws
+
+
+def log_order_full(order: dict):
+    """Как log_order, плюс партнёр, ваш курс, доход партнёра и статус.
+    Возвращает номер строки (он же номер заявки + 1)."""
+    ws = _orders_ws()
+    row = [
+        order.get("datetime", ""), order.get("name", ""), order.get("username", ""),
+        order.get("telegram_id", ""), order.get("city", ""), order.get("pair", ""),
+        order.get("amount", ""), order.get("rate", ""), order.get("total_vnd", ""),
+        order.get("partner", ""), order.get("base_rate", ""), order.get("partner_income", ""),
+        order.get("status", "новая"),
+    ]
+    resp = ws.append_row(row, value_input_option="USER_ENTERED")
+    rng = ((resp or {}).get("updates") or {}).get("updatedRange", "")
+    import re
+    m = re.search(r"!A(\d+)", rng)
+    return int(m.group(1)) if m else None
+
+
+def get_order(row_no):
+    ws = _orders_ws()
+    vals = ws.row_values(row_no)
+    vals = (vals + [""] * len(ORDERS_HEADER))[: len(ORDERS_HEADER)]
+    return dict(zip(ORDERS_HEADER, vals))
+
+
+def set_order_status(row_no, status):
+    _orders_ws().update_cell(row_no, COL_O_STATUS, status)
+
+
+def partner_orders(code, month_prefix):
+    """Заявки партнёра за месяц ('2026-10'): список (номер строки, dict)."""
+    ws = _orders_ws()
+    out = []
+    for i, vals in enumerate(ws.get_all_values()[1:], start=2):
+        vals = (vals + [""] * len(ORDERS_HEADER))[: len(ORDERS_HEADER)]
+        d = dict(zip(ORDERS_HEADER, vals))
+        if d["Партнёр"].strip().lower() == code and d["Дата/время"].startswith(month_prefix):
+            out.append((i, d))
+    return out
