@@ -12,7 +12,7 @@ import html
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from telegram import (
     BotCommand,
@@ -209,13 +209,22 @@ async def cmd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+VN_TZ = timezone(timedelta(hours=7))
+
+
+def now_vn() -> datetime:
+    """Текущее время во Вьетнаме (сервер Railway живёт по UTC)."""
+    return datetime.now(VN_TZ)
+
+
 def format_client_block(user) -> str:
-    """Формирует блок с именем, username и ID клиента для заявок/уведомлений."""
-    username_line = f"@{user.username}" if user.username else "не указан"
+    """Блок с именем, username и ID клиента (HTML). Имя — ссылка на профиль,
+    по ней можно написать клиенту, даже если у него нет username."""
+    username_line = f"@{html.escape(user.username)}" if user.username else "не указан"
     return (
-        f"👤 Имя: {user.full_name}\n"
+        f'👤 Имя: <a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>\n'
         f"🔗 Username: {username_line}\n"
-        f"🆔 Telegram ID: {user.id}"
+        f"🆔 Telegram ID: <code>{user.id}</code>"
     )
 
 
@@ -282,7 +291,8 @@ async def partner_login(update: Update, context: ContextTypes.DEFAULT_TYPE, arg:
     )
     await context.bot.send_message(
         chat_id=MANAGER_CHAT_ID,
-        text=f"🤝 Партнёр «{p['name']}» подключился к боту.\n{format_client_block(update.effective_user)}",
+        text=f"🤝 Партнёр «{html.escape(p['name'])}» подключился к боту.\n{format_client_block(update.effective_user)}",
+        parse_mode="HTML",
     )
 
 
@@ -322,12 +332,12 @@ async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not p:
         await update.message.reply_text("Эта команда для партнёров.")
         return
-    month = datetime.now().strftime("%Y-%m")
+    month = now_vn().strftime("%Y-%m")
     orders = sheets.partner_orders(p["code"], month)
     if not orders:
         await update.message.reply_text("В этом месяце заявок от ваших клиентов пока нет.")
         return
-    lines = [f"📋 <b>Ваши заявки за {datetime.now().strftime('%m.%Y')}</b>", ""]
+    lines = [f"📋 <b>Ваши заявки за {now_vn().strftime('%m.%Y')}</b>", ""]
     done_sum = done_income = 0.0
     done_n = lost_n = 0
     for row_no, d in orders:
@@ -385,10 +395,12 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer(STATUSES[st])
 
-    text = "\n".join(l for l in (query.message.text or "").split("\n") if not l.startswith("📌 Статус:"))
+    old = getattr(query.message, "text_html", None) or html.escape(query.message.text or "")
+    text = "\n".join(l for l in old.split("\n") if not l.startswith("📌 Статус:"))
     final = st in ("done", "lost")
     await query.edit_message_text(
         f"{text}\n📌 Статус: {STATUSES[st]}",
+        parse_mode="HTML",
         reply_markup=None if final else status_keyboard(row_no),
     )
 
@@ -423,7 +435,7 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{format_client_block(user)}\n\n"
         "Клиент хочет связаться с менеджером напрямую."
     )
-    await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=manager_text)
+    await context.bot.send_message(chat_id=MANAGER_CHAT_ID, text=manager_text, parse_mode="HTML")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -593,7 +605,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             row_no = sheets.log_order_full(
                 {
-                    "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "datetime": now_vn().strftime("%Y-%m-%d %H:%M"),
                     "name": user.full_name,
                     "username": f"@{user.username}" if user.username else "",
                     "telegram_id": user.id,
@@ -613,7 +625,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         number = f" №{row_no - 1}" if row_no else ""
         partner_line = (
-            f"🤝 Клиент партнёра: {partner['name']} (ваш курс {fmt_rate(base_rate)}, "
+            f"🤝 Клиент партнёра: {html.escape(partner['name'])} (ваш курс {fmt_rate(base_rate)}, "
             f"доход партнёра {fmt_num(income)} ₫)\n\n"
             if partner else ""
         )
@@ -622,12 +634,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{partner_line}"
             f"{format_client_block(user)}\n\n"
             "📋 Подтверждённые условия:\n"
-            f"{summary}\n\n"
-            f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            f"{html.escape(summary)}\n\n"
+            f"🕒 {now_vn().strftime('%Y-%m-%d %H:%M')}\n"
             "📌 Статус: 🆕 новая"
         )
         await context.bot.send_message(
-            chat_id=MANAGER_CHAT_ID, text=manager_text, reply_markup=status_keyboard(row_no)
+            chat_id=MANAGER_CHAT_ID, text=manager_text, parse_mode="HTML",
+            reply_markup=status_keyboard(row_no),
         )
 
         if partner and partner["chat_id"]:
