@@ -49,7 +49,7 @@ CITIES = ["Дананг", "Нячанг", "Фукуок"]
 CURRENCIES = {"RUB": "RUB/VND", "USD": "USD/VND", "USDT": "USDT/VND"}
 
 AMOUNT_PRESETS = {
-    "RUB/VND": ["10 000", "30 000", "50 000", "100 000"],
+    "RUB/VND": ["15 000", "30 000", "50 000", "100 000"],
     "USD/VND": ["100", "300", "500", "1 000"],
     "USDT/VND": ["100", "300", "500", "1 000"],
 }
@@ -510,6 +510,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         rate_row = sheets.get_rate(pair, amount)
+        min_amount = sheets.get_min_amount(pair) if not rate_row else None
+        if not rate_row and min_amount and amount < min_amount:
+            await update.message.reply_text(
+                f"Минимальная сумма обмена — {fmt_num(min_amount)} {CURRENCY_LABEL[pair]}. "
+                "Укажите сумму побольше, пожалуйста.",
+                reply_markup=amount_keyboard(pair),
+            )
+            return
         if not rate_row:
             await update.message.reply_text(
                 "Для такой суммы курс сейчас не настроен. "

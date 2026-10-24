@@ -109,6 +109,21 @@ def get_rate(pair: str, amount: float):
     return None
 
 
+def get_min_amount(pair: str):
+    """Наименьшая сумма «от» для пары в листе курсов (минимум обмена) или None."""
+    try:
+        rows = _get_client().open_by_key(SHEET_ID).worksheet(WORKSHEET_NAME).get_all_values()[1:]
+    except Exception:
+        log.exception("Не удалось прочитать минимальную сумму")
+        return None
+    lows = [
+        _to_float(r[COL_FROM]) for r in rows
+        if len(r) > COL_FROM and r[COL_PAIR].strip() == pair and _to_float(r[COL_RATE]) is not None
+    ]
+    lows = [x for x in lows if x is not None]
+    return min(lows) if lows else None
+
+
 def get_best_rates():
     """Возвращает лучший (самый выгодный) курс по каждой из трёх пар
     RUB/VND, USD/VND, USDT/VND — для RUB/VND это тариф с наибольшим
