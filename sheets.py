@@ -433,3 +433,21 @@ def partner_orders(code, month_prefix):
         if d["Партнёр"].strip().lower() == code and d["Дата/время"].startswith(month_prefix):
             out.append((i, d))
     return out
+
+
+
+# ---------------------------------------------------------------------------
+# РЕЗЕРВНАЯ КОПИЯ: все листы таблицы → CSV в zip (на случай, если Google недоступен)
+# ---------------------------------------------------------------------------
+def backup_zip() -> bytes:
+    import csv
+    import io
+    import zipfile
+    out = io.BytesIO()
+    spreadsheet = _get_client().open_by_key(SHEET_ID)
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for ws in spreadsheet.worksheets():
+            buf = io.StringIO()
+            csv.writer(buf, delimiter=";").writerows(ws.get_all_values())
+            z.writestr(f"{ws.title}.csv", "\ufeff" + buf.getvalue())
+    return out.getvalue()

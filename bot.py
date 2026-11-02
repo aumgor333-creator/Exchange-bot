@@ -11,6 +11,8 @@ import hmac
 import html
 import logging
 import os
+import asyncio
+import io
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -726,7 +728,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def send_backup(bot, note="Ежедневная резервная копия"):
+    """Все листы таблицы (курсы, заявки, партнёры) — zip с CSV в чат менеджера."""
+    data = await asyncio.to_thread(sheets.backup_zip)
+    day = now_vn().strftime("%Y-%m-%d")
+    await bot.send_document(
+        chat_id=MANAGER_CHAT_ID, document=io.BytesIO(data), filename=f"obmen-backup-{day}.zip",
+        caption=f"💾 {note} ({day}): курсы, заявки, партнёры — CSV, открываются в Excel.",
+    )
+
+
+async def backup_loop(app: Application):
+    last = None
+    while True:
+        await asyncio.sleep(600)
+        try:
+            n = now_vn()
+            if n.hour >= 3 and last != n.date():
+                await send_backup(app.bot)
+                last = n.date()
+        except Exception:
+            log.exception("Резервная копия не отправлена")
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/backup — только в чате менеджера."""
+    if not is_manager_chat(update.effective_chat.id):
+        return
+    try:
+        await send_backup(context.bot, "Резервная копия по запросу")
+    except Exception:
+        log.exception("Резервная копия не отправлена")
+        await update.message.reply_text("Не получилось сделать копию, попробуйте позже.")
+
+
 async def _post_init(app: Application):
+    asyncio.get_running_loop().create_task(backup_loop(app))
     await app.bot.set_my_commands(
         [
             BotCommand("exchange", "Оформить заявку на обмен"),
@@ -753,6 +790,7 @@ def main():
     app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("partners", cmd_partners))
     app.add_handler(CommandHandler("my", cmd_my))
+    app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
