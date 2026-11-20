@@ -451,3 +451,40 @@ def backup_zip() -> bytes:
             csv.writer(buf, delimiter=";").writerows(ws.get_all_values())
             z.writestr(f"{ws.title}.csv", "\ufeff" + buf.getvalue())
     return out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Смена курсов из Telegram (/kurs) — пишет в лист «Мои курсы», колонку «Курс».
+# ---------------------------------------------------------------------------
+def rate_tiers(pair: str, worksheet: str = None):
+    """Ступени курса пары от большей суммы к меньшей:
+    [{'row': номер строки, 'from': от, 'to': до, 'rate': курс}, ...]."""
+    ws = _get_client().open_by_key(SHEET_ID).worksheet(worksheet or own_sheet())
+    tiers = []
+    for i, row in enumerate(ws.get_all_values()[1:], start=2):
+        if len(row) <= max(COL_PAIR, COL_FROM, COL_TO, COL_RATE) or row[COL_PAIR].strip() != pair:
+            continue
+        rate = _to_float(row[COL_RATE])
+        if rate is None:
+            continue
+        tiers.append({"row": i, "from": _to_float(row[COL_FROM]) or 0, "to": _to_float(row[COL_TO]), "rate": rate})
+    tiers.sort(key=lambda t: t["from"], reverse=True)
+    return tiers
+
+
+def set_rates(pair: str, values, worksheet: str = None):
+    """Записывает новые курсы по ступеням (порядок — от большей суммы к меньшей).
+    Возвращает ступени с полями 'old' и 'rate' (новый)."""
+    name = worksheet or own_sheet()
+    tiers = rate_tiers(pair, name)
+    if len(values) != len(tiers):
+        raise ValueError(f"в таблице {len(tiers)} ступ. для {pair}, а указано {len(values)}")
+    col = gspread.utils.rowcol_to_a1(1, COL_RATE + 1).rstrip("1")
+    ws = _get_client().open_by_key(SHEET_ID).worksheet(name)
+    ws.batch_update(
+        [{"range": f"{col}{t['row']}", "values": [[v]]} for t, v in zip(tiers, values)],
+        value_input_option="USER_ENTERED",
+    )
+    for t, v in zip(tiers, values):
+        t["old"], t["rate"] = t["rate"], v
+    return tiers

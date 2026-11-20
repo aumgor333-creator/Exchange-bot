@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 from telegram import (
     BotCommand,
+    BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -762,6 +763,93 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не получилось сделать копию, попробуйте позже.")
 
 
+KURS_PAIRS = {"rub": "RUB/VND", "usd": "USD/VND", "usdt": "USDT/VND"}
+KURS_MAX_JUMP = 0.2  # защита от опечатки: не больше ±20% от текущего курса
+
+
+def _tier_label(t, pair):
+    cur = pair.split("/")[0]
+    sign = "₽" if cur == "RUB" else cur
+    return f"от {fmt_num(t['from'])} {sign}" if t["from"] else "любая сумма"
+
+
+async def cmd_kurs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/kurs 288 287 286 — только в чате менеджера: новые курсы RUB в «Мои курсы»
+    (от большей суммы к меньшей). /kurs usd 25500 — для USD/VND, /kurs usdt … — для USDT."""
+    if not is_manager_chat(update.effective_chat.id):
+        return
+    args = list(context.args or [])
+    pair = "RUB/VND"
+    if args and args[0].lower() in KURS_PAIRS:
+        pair = KURS_PAIRS[args.pop(0).lower()]
+    try:
+        values = [float(a.replace(",", ".")) for a in args]
+        values = [int(v) if v.is_integer() else v for v in values]
+    except ValueError:
+        values = None
+    try:
+        tiers = await asyncio.to_thread(sheets.rate_tiers, pair)
+    except Exception:
+        log.exception("Не удалось прочитать курсы")
+        await update.message.reply_text("Не получилось прочитать таблицу, попробуйте позже.")
+        return
+    if not tiers:
+        await update.message.reply_text(f"В листе «{sheets.own_sheet()}» нет строк {pair}.")
+        return
+    now_line = " / ".join(fmt_rate(t["rate"]) for t in tiers)
+    if not values or len(values) != len(tiers) or any(v <= 0 for v in values):
+        example = " ".join(fmt_rate(t["rate"]) for t in tiers)
+        steps = "\n".join(f"• {_tier_label(t, pair)} — {fmt_rate(t['rate'])}" for t in tiers)
+        key = next(k for k, v in KURS_PAIRS.items() if v == pair)
+        prefix = "" if pair == "RUB/VND" else f"{key} "
+        await update.message.reply_text(
+            f"Сейчас {pair}:\n{steps}\n\n"
+            f"Чтобы поменять, напишите {len(tiers)} числа по порядку (от большей суммы к меньшей):\n"
+            f"/kurs {prefix}{example}\n\n"
+            "Для долларов: /kurs usd …, для USDT: /kurs usdt …"
+        )
+        return
+    bad = [(t, v) for t, v in zip(tiers, values) if abs(v - t["rate"]) > t["rate"] * KURS_MAX_JUMP]
+    if bad:
+        t, v = bad[0]
+        await update.message.reply_text(
+            f"Похоже на опечатку: {_tier_label(t, pair)} было {fmt_rate(t['rate'])}, а указано {fmt_rate(v)}. "
+            "Ничего не менял. Если курс правда так изменился — поправьте его в таблице."
+        )
+        return
+    try:
+        tiers = await asyncio.to_thread(sheets.set_rates, pair, values)
+    except Exception:
+        log.exception("Не удалось записать курсы")
+        await update.message.reply_text("Не получилось записать в таблицу, курсы не изменены. Попробуйте позже.")
+        return
+    lines = [f"✅ {pair} обновлён в «{sheets.own_sheet()}»:"]
+    for t in tiers:
+        was = "" if t["old"] == t["rate"] else f"  (было {fmt_rate(t['old'])})"
+        lines.append(f"• {_tier_label(t, pair)} — {fmt_rate(t['rate'])}{was}")
+    try:
+        partners = sheets.get_partners(force=True)
+    except Exception:
+        partners = {}
+    for p in partners.values():
+        try:
+            got = []
+            for t in tiers:
+                amount = t["from"] or 1
+                if sheet_mode(p):
+                    row = await asyncio.to_thread(sheets.get_rate, pair, amount, p["sheet"])
+                    got.append(fmt_rate(row["rate"]) if row else "—")
+                else:
+                    got.append(fmt_rate(sheets.partner_rate(t["rate"], p["margin"], p.get("diff"))))
+            if all(g == "—" for g in got):
+                continue
+            where = f" (лист «{p['sheet']}»)" if sheet_mode(p) else ""
+            lines.append(f"\n🤝 У партнёра {p['name']}{where}: " + " / ".join(got))
+        except Exception:
+            log.exception("Не удалось посчитать курс партнёра")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def _post_init(app: Application):
     asyncio.get_running_loop().create_task(backup_loop(app))
     await app.bot.set_my_commands(
@@ -772,6 +860,18 @@ async def _post_init(app: Application):
             BotCommand("start", "Начать обмен"),
         ]
     )
+    try:  # меню команд в чате менеджера — клиенты эти команды не видят
+        await app.bot.set_my_commands(
+            [
+                BotCommand("kurs", "Поменять курсы: /kurs 288 287 286"),
+                BotCommand("rate", "Актуальные курсы валют и USDT"),
+                BotCommand("partners", "Ссылки партнёров"),
+                BotCommand("backup", "Резервная копия таблицы"),
+            ],
+            scope=BotCommandScopeChat(chat_id=int(MANAGER_CHAT_ID)),
+        )
+    except Exception:
+        log.exception("Не удалось задать меню команд менеджера")
 
 
 def main():
@@ -791,6 +891,7 @@ def main():
     app.add_handler(CommandHandler("partners", cmd_partners))
     app.add_handler(CommandHandler("my", cmd_my))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("kurs", cmd_kurs))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
