@@ -460,14 +460,22 @@ def rate_tiers(pair: str, worksheet: str = None):
     """Ступени курса пары от большей суммы к меньшей:
     [{'row': номер строки, 'from': от, 'to': до, 'rate': курс}, ...]."""
     ws = _get_client().open_by_key(SHEET_ID).worksheet(worksheet or own_sheet())
+    values = ws.get_all_values()
+    try:
+        formulas = ws.get_all_values(value_render_option="FORMULA")
+    except Exception:
+        formulas = values
     tiers = []
-    for i, row in enumerate(ws.get_all_values()[1:], start=2):
+    for i, row in enumerate(values[1:], start=2):
         if len(row) <= max(COL_PAIR, COL_FROM, COL_TO, COL_RATE) or row[COL_PAIR].strip() != pair:
             continue
         rate = _to_float(row[COL_RATE])
         if rate is None:
             continue
-        tiers.append({"row": i, "from": _to_float(row[COL_FROM]) or 0, "to": _to_float(row[COL_TO]), "rate": rate})
+        frow = formulas[i - 1] if i - 1 < len(formulas) else []
+        is_formula = len(frow) > COL_RATE and str(frow[COL_RATE]).startswith("=")
+        tiers.append({"row": i, "from": _to_float(row[COL_FROM]) or 0, "to": _to_float(row[COL_TO]),
+                      "rate": rate, "formula": is_formula})
     tiers.sort(key=lambda t: t["from"], reverse=True)
     return tiers
 

@@ -261,6 +261,8 @@ def partner_login_code(code: str) -> str:
 
 def client_partner(user_id):
     """Партнёр, за которым закреплён клиент (dict) или None. Ошибки таблицы не ломают бота."""
+    if str(user_id) == str(MANAGER_CHAT_ID):
+        return None  # менеджер всегда видит свои курсы, даже если проверял ссылку партнёра
     try:
         code = sheets.get_client_partner(user_id)
         return sheets.get_partners().get(code) if code else None
@@ -765,6 +767,30 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 KURS_PAIRS = {"rub": "RUB/VND", "usd": "USD/VND", "usdt": "USDT/VND"}
 KURS_MAX_JUMP = 0.2  # защита от опечатки: не больше ±20% от текущего курса
+_TRANSLIT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i",
+    "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
+    "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch", "ы": "y", "э": "e",
+    "ю": "yu", "я": "ya", "ь": "", "ъ": "",
+})
+
+
+def _lat(text):
+    return (text or "").lower().translate(_TRANSLIT)
+
+
+def _partner_alias(p):
+    """Короткое имя партнёра для команды: первое слово имени латиницей (Артём → artem)."""
+    word = re.split(r"[\s·,.(]+", (p.get("name") or "").strip())[0]
+    return _lat(word) or p["code"]
+
+
+def _find_partner(arg, partners):
+    a = _lat(arg)
+    for p in partners.values():
+        if a in (p["code"], _partner_alias(p)):
+            return p
+    return None
 
 
 def _tier_label(t, pair):
@@ -773,12 +799,42 @@ def _tier_label(t, pair):
     return f"от {fmt_num(t['from'])} {sign}" if t["from"] else "любая сумма"
 
 
+def _rates_line(tiers):
+    return " / ".join(fmt_rate(t["rate"]) for t in tiers)
+
+
+def _rates_args(tiers):
+    """Курсы для примера команды: через пробел, без пробелов внутри числа."""
+    return " ".join(f"{t['rate']:g}" for t in tiers)
+
+
+async def _partner_sheets():
+    """[(партнёр, его лист)] — партнёры, у которых есть свой «Лист курсов»."""
+    try:
+        partners = await asyncio.to_thread(sheets.get_partners, True)
+    except Exception:
+        log.exception("Партнёры недоступны")
+        return {}, []
+    return partners, [(p, p["sheet"]) for p in partners.values() if sheet_mode(p)]
+
+
 async def cmd_kurs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/kurs 288 287 286 — только в чате менеджера: новые курсы RUB в «Мои курсы»
-    (от большей суммы к меньшей). /kurs usd 25500 — для USD/VND, /kurs usdt … — для USDT."""
+    """Только в чате менеджера. Числа — от большей суммы к меньшей.
+    /kurs 288 287 286 — ваши курсы RUB в «Мои курсы»
+    /kurs artem 285 284 283 — курсы партнёра в его листе (например «Лист1»)
+    /kurs usd 25500, /kurs artem usdt 25200 — доллары и USDT
+    /kurs — показать все курсы."""
     if not is_manager_chat(update.effective_chat.id):
         return
     args = list(context.args or [])
+    partners, psheets = await _partner_sheets()
+    target = None  # партнёр, чей лист меняем; None — «Мои курсы»
+    if args and not re.fullmatch(r"[\d.,]+", args[0]) and args[0].lower() not in KURS_PAIRS:
+        target = _find_partner(args.pop(0), partners)
+        if not target or not sheet_mode(target):
+            names = ", ".join(_partner_alias(p) for p, _ in psheets) or "нет"
+            await update.message.reply_text(f"Не нашёл такого партнёра со своим листом курсов. Есть: {names}")
+            return
     pair = "RUB/VND"
     if args and args[0].lower() in KURS_PAIRS:
         pair = KURS_PAIRS[args.pop(0).lower()]
@@ -787,28 +843,37 @@ async def cmd_kurs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         values = [int(v) if v.is_integer() else v for v in values]
     except ValueError:
         values = None
+    sheet_name = target["sheet"] if target else sheets.own_sheet()
+
     try:
-        tiers = await asyncio.to_thread(sheets.rate_tiers, pair)
+        tiers = await asyncio.to_thread(sheets.rate_tiers, pair, sheet_name)
     except Exception:
         log.exception("Не удалось прочитать курсы")
         await update.message.reply_text("Не получилось прочитать таблицу, попробуйте позже.")
         return
     if not tiers:
-        await update.message.reply_text(f"В листе «{sheets.own_sheet()}» нет строк {pair}.")
+        await update.message.reply_text(f"В листе «{sheet_name}» нет строк {pair}.")
         return
-    now_line = " / ".join(fmt_rate(t["rate"]) for t in tiers)
+
+    pkey = next(k for k, v in KURS_PAIRS.items() if v == pair)
+    pair_arg = "" if pair == "RUB/VND" else f"{pkey} "
+
     if not values or len(values) != len(tiers) or any(v <= 0 for v in values):
-        example = " ".join(fmt_rate(t["rate"]) for t in tiers)
-        steps = "\n".join(f"• {_tier_label(t, pair)} — {fmt_rate(t['rate'])}" for t in tiers)
-        key = next(k for k, v in KURS_PAIRS.items() if v == pair)
-        prefix = "" if pair == "RUB/VND" else f"{key} "
-        await update.message.reply_text(
-            f"Сейчас {pair}:\n{steps}\n\n"
-            f"Чтобы поменять, напишите {len(tiers)} числа по порядку (от большей суммы к меньшей):\n"
-            f"/kurs {prefix}{example}\n\n"
-            "Для долларов: /kurs usd …, для USDT: /kurs usdt …"
-        )
+        lines = [f"📊 {pair}", "", f"Ваши («{sheets.own_sheet()}»):"]
+        own = tiers if not target else await asyncio.to_thread(sheets.rate_tiers, pair, sheets.own_sheet())
+        lines += [f"• {_tier_label(t, pair)} — {fmt_rate(t['rate'])}" for t in own]
+        lines += ["", f"Поменять: /kurs {pair_arg}{_rates_args(own)}"]
+        for p, sh in psheets:
+            pt = await asyncio.to_thread(sheets.rate_tiers, pair, sh)
+            if not pt:
+                continue
+            how = "формулы, меняются сами" if all(t["formula"] for t in pt) else "числа вручную"
+            lines += ["", f"🤝 {p['name']} («{sh}», {how}): {_rates_line(pt)}",
+                      f"Поменять: /kurs {_partner_alias(p)} {pair_arg}{_rates_args(pt)}"]
+        lines += ["", "Числа — от большей суммы к меньшей. Доллары: usd, USDT: usdt."]
+        await update.message.reply_text("\n".join(lines))
         return
+
     bad = [(t, v) for t, v in zip(tiers, values) if abs(v - t["rate"]) > t["rate"] * KURS_MAX_JUMP]
     if bad:
         t, v = bad[0]
@@ -817,36 +882,34 @@ async def cmd_kurs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Ничего не менял. Если курс правда так изменился — поправьте его в таблице."
         )
         return
+    had_formulas = any(t["formula"] for t in tiers)
     try:
-        tiers = await asyncio.to_thread(sheets.set_rates, pair, values)
+        tiers = await asyncio.to_thread(sheets.set_rates, pair, values, sheet_name)
     except Exception:
         log.exception("Не удалось записать курсы")
         await update.message.reply_text("Не получилось записать в таблицу, курсы не изменены. Попробуйте позже.")
         return
-    lines = [f"✅ {pair} обновлён в «{sheets.own_sheet()}»:"]
+
+    who = f"у партнёра {target['name']}" if target else "ваши"
+    lines = [f"✅ {pair} — {who}, лист «{sheet_name}»:"]
     for t in tiers:
         was = "" if t["old"] == t["rate"] else f"  (было {fmt_rate(t['old'])})"
         lines.append(f"• {_tier_label(t, pair)} — {fmt_rate(t['rate'])}{was}")
-    try:
-        partners = sheets.get_partners(force=True)
-    except Exception:
-        partners = {}
-    for p in partners.values():
-        try:
-            got = []
-            for t in tiers:
-                amount = t["from"] or 1
-                if sheet_mode(p):
-                    row = await asyncio.to_thread(sheets.get_rate, pair, amount, p["sheet"])
-                    got.append(fmt_rate(row["rate"]) if row else "—")
-                else:
-                    got.append(fmt_rate(sheets.partner_rate(t["rate"], p["margin"], p.get("diff"))))
-            if all(g == "—" for g in got):
+    if target and had_formulas:
+        lines.append("\nФормулы в этих ячейках заменены числами — теперь этот лист сам за вашими курсами не меняется.")
+    if not target:
+        for p, sh in psheets:
+            try:
+                pt = await asyncio.to_thread(sheets.rate_tiers, pair, sh)
+            except Exception:
                 continue
-            where = f" (лист «{p['sheet']}»)" if sheet_mode(p) else ""
-            lines.append(f"\n🤝 У партнёра {p['name']}{where}: " + " / ".join(got))
-        except Exception:
-            log.exception("Не удалось посчитать курс партнёра")
+            if not pt:
+                continue
+            if all(t["formula"] for t in pt):
+                lines.append(f"\n🤝 {p['name']} («{sh}»): {_rates_line(pt)} — пересчиталось само")
+            else:
+                lines.append(f"\n🤝 {p['name']} («{sh}»): {_rates_line(pt)} — там числа, не меняются сами.\n"
+                             f"Поменять: /kurs {_partner_alias(p)} {pair_arg}…")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -863,7 +926,7 @@ async def _post_init(app: Application):
     try:  # меню команд в чате менеджера — клиенты эти команды не видят
         await app.bot.set_my_commands(
             [
-                BotCommand("kurs", "Поменять курсы: /kurs 288 287 286"),
+                BotCommand("kurs", "Курсы: /kurs 288 287 286, /kurs artem 285 284 283"),
                 BotCommand("rate", "Актуальные курсы валют и USDT"),
                 BotCommand("partners", "Ссылки партнёров"),
                 BotCommand("backup", "Резервная копия таблицы"),
